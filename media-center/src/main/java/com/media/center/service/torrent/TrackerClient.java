@@ -25,8 +25,8 @@ public class TrackerClient {
 
             URL url = new URL(urlStr);
             HttpURLConnection conn = (HttpURLConnection) url.openConnection(ProxyConfig.getProxy());
-            conn.setConnectTimeout(3000); // Reduced to 3s for faster scanning
-            conn.setReadTimeout(3000);
+            conn.setConnectTimeout(10000); // Increased to 10s
+            conn.setReadTimeout(10000);
             conn.setRequestMethod("GET");
 
             if (conn.getResponseCode() == 200) {

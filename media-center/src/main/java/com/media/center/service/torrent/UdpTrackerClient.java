@@ -18,7 +18,7 @@ public class UdpTrackerClient {
     private static final long CONNECT_MAGIC = 0x41727101980L;
     private static final int ACTION_CONNECT = 0;
     private static final int ACTION_ANNOUNCE = 1;
-    private static final int TIMEOUT_MS = 3000;
+    private static final int TIMEOUT_MS = 10000;
 
     /**
      * Query a UDP tracker for peers.

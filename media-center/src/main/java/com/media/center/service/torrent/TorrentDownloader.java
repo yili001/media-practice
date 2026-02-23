@@ -47,6 +47,7 @@ public class TorrentDownloader implements Runnable {
     // Peer tracking: skip dead peers, prefer working ones
     private final Set<String> badPeers = Collections.synchronizedSet(new HashSet<>());
     private final ConcurrentLinkedQueue<TrackerClient.Peer> goodPeers = new ConcurrentLinkedQueue<>();
+    private final Set<String> activeConnections = ConcurrentHashMap.newKeySet();
 
     // Upload state
     private long uploadedBytes = 0;
@@ -427,7 +428,9 @@ public class TorrentDownloader implements Runnable {
         // Use a mutable, thread-safe peer list so re-announce can add more peers
         List<TrackerClient.Peer> livePeers = new java.util.concurrent.CopyOnWriteArrayList<>(peers);
 
-        int maxConnections = Math.min(livePeers.size(), 30);
+        // Decouple worker pool size from initial peer count, hardcode to 60 for better
+        // performance.
+        int maxConnections = 60;
         ExecutorService peerPool = Executors.newFixedThreadPool(maxConnections);
         BlockingQueue<Integer> pieceQueue = new LinkedBlockingQueue<>();
         for (int i = 0; i < totalPieces; i++) {
@@ -480,16 +483,27 @@ public class TorrentDownloader implements Runnable {
                     }
 
                     // === Smart peer selection ===
-                    TrackerClient.Peer peer = goodPeers.poll();
+                    TrackerClient.Peer peer = null;
+                    while (true) {
+                        peer = goodPeers.poll();
+                        if (peer != null) {
+                            String key = peer.ip + ":" + peer.port;
+                            if (activeConnections.add(key)) {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+
                     if (peer == null) {
                         int tried = 0;
                         int listSize = livePeers.size();
-                        peer = null;
                         while (tried < listSize) {
                             TrackerClient.Peer candidate = livePeers.get(peerIdx % listSize);
                             peerIdx++;
                             String key = candidate.ip + ":" + candidate.port;
-                            if (!badPeers.contains(key)) {
+                            if (!badPeers.contains(key) && activeConnections.add(key)) {
                                 peer = candidate;
                                 break;
                             }
@@ -512,8 +526,8 @@ public class TorrentDownloader implements Runnable {
 
                     // Establish ONE persistent connection to this peer
                     try (Socket socket = new Socket(ProxyConfig.getPeerProxy())) {
-                        socket.connect(new InetSocketAddress(currentPeer.ip, currentPeer.port), 5000);
-                        socket.setSoTimeout(15000);
+                        socket.connect(new InetSocketAddress(currentPeer.ip, currentPeer.port), 10000);
+                        socket.setSoTimeout(30000); // Increased from 15s to 30s to tolerate slow peers
                         socket.setTcpNoDelay(true);
                         socket.setReceiveBufferSize(256 * 1024);
                         socket.setSendBufferSize(64 * 1024);
@@ -556,6 +570,7 @@ public class TorrentDownloader implements Runnable {
                         // === Wait for unchoke (once per connection) ===
                         boolean unchoked = false;
                         long startTime = System.currentTimeMillis();
+                        boolean[] peerHasPiece = new boolean[totalPieces];
                         while (System.currentTimeMillis() - startTime < 15000 && !unchoked && !stopped) {
                             int len = in.readInt();
                             if (len == 0)
@@ -563,6 +578,19 @@ public class TorrentDownloader implements Runnable {
                             byte msgId = in.readByte();
                             if (msgId == 1) {
                                 unchoked = true;
+                            } else if (msgId == 4) {
+                                int pIdx = in.readInt();
+                                if (pIdx >= 0 && pIdx < totalPieces) {
+                                    peerHasPiece[pIdx] = true;
+                                }
+                            } else if (msgId == 5) {
+                                byte[] bitfield = new byte[len - 1];
+                                in.readFully(bitfield);
+                                for (int i = 0; i < totalPieces; i++) {
+                                    if ((bitfield[i / 8] & (1 << (7 - (i % 8)))) != 0) {
+                                        peerHasPiece[i] = true;
+                                    }
+                                }
                             } else {
                                 skipBytes(in, len - 1);
                             }
@@ -589,12 +617,22 @@ public class TorrentDownloader implements Runnable {
                             if (stopped)
                                 return;
 
-                            Integer pieceIndex = pieceQueue.poll();
-                            if (pieceIndex == null)
+                            Integer pieceIndex = null;
+                            for (Integer p : pieceQueue) {
+                                if (peerHasPiece[p]) {
+                                    if (pieceQueue.remove(p)) {
+                                        pieceIndex = p;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (pieceIndex == null) {
                                 break;
+                            }
 
                             try {
-                                byte[] pieceData = requestPiece(in, out, pieceIndex);
+                                byte[] pieceData = requestPiece(in, out, pieceIndex, peerHasPiece);
                                 if (pieceData != null && verifyPiece(pieceIndex, pieceData)) {
                                     // Write to disk asynchronously — don't block the network
                                     final int idx = pieceIndex;
@@ -645,6 +683,8 @@ public class TorrentDownloader implements Runnable {
                         String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
                         System.err.println("Worker " + workerIdx + " failed " +
                                 currentPeer.ip + ":" + currentPeer.port + " - " + msg);
+                    } finally {
+                        activeConnections.remove(currentPeer.ip + ":" + currentPeer.port);
                     }
                 }
             }));
@@ -702,7 +742,7 @@ public class TorrentDownloader implements Runnable {
      * Request a single piece over an already-established connection.
      * Sends all block requests (pipelining) then reads responses.
      */
-    private byte[] requestPiece(DataInputStream in, DataOutputStream out, int pieceIndex)
+    private byte[] requestPiece(DataInputStream in, DataOutputStream out, int pieceIndex, boolean[] peerHasPiece)
             throws IOException {
         int expectedPieceSize = getPieceSize(pieceIndex);
         int blockSize = 16384; // 16KB
@@ -710,28 +750,36 @@ public class TorrentDownloader implements Runnable {
         byte[] pieceData = new byte[expectedPieceSize];
         boolean[] receivedBlocks = new boolean[numBlocks];
         int receivedCount = 0;
+        int requestedCount = 0;
+        int maxPendingRequests = 10;
+        int nextBlockToRequest = 0;
 
-        // Pipeline all block requests at once
-        for (int block = 0; block < numBlocks; block++) {
-            int offset = block * blockSize;
-            int length = Math.min(blockSize, expectedPieceSize - offset);
-            out.writeInt(13); // message length
-            out.writeByte(6); // request
-            out.writeInt(pieceIndex);
-            out.writeInt(offset);
-            out.writeInt(length);
-        }
-        out.flush();
+        // Pipeline blocks with a sliding window
+        long lastActivityTime = System.currentTimeMillis();
+        long pieceTimeoutMs = 30000; // 30 seconds idle timeout
+        while (receivedCount < numBlocks && System.currentTimeMillis() - lastActivityTime < pieceTimeoutMs) {
 
-        // Receive piece blocks
-        long startTime = System.currentTimeMillis();
-        while (receivedCount < numBlocks && System.currentTimeMillis() - startTime < 15000) {
+            // Fill pipeline up to maxPendingRequests
+            while (requestedCount - receivedCount < maxPendingRequests && nextBlockToRequest < numBlocks) {
+                int offset = nextBlockToRequest * blockSize;
+                int length = Math.min(blockSize, expectedPieceSize - offset);
+                out.writeInt(13); // message length
+                out.writeByte(6); // request
+                out.writeInt(pieceIndex);
+                out.writeInt(offset);
+                out.writeInt(length);
+                nextBlockToRequest++;
+                requestedCount++;
+            }
+            out.flush();
+
             int len = in.readInt();
             if (len == 0)
                 continue; // keep-alive
             byte msgId = in.readByte();
 
             if (msgId == 7) { // piece
+                lastActivityTime = System.currentTimeMillis();
                 int index = in.readInt();
                 int begin = in.readInt();
                 int dataLen = len - 9;
@@ -749,6 +797,11 @@ public class TorrentDownloader implements Runnable {
                 }
             } else if (msgId == 0) { // choke
                 return null;
+            } else if (msgId == 4) { // HAVE
+                int pIdx = in.readInt();
+                if (pIdx >= 0 && pIdx < peerHasPiece.length) {
+                    peerHasPiece[pIdx] = true;
+                }
             } else if (msgId == 6) { // REQUEST from peer — serve upload
                 int reqIdx = in.readInt();
                 int reqBegin = in.readInt();
