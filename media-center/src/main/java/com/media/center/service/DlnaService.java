@@ -18,12 +18,22 @@ import org.w3c.dom.NodeList;
 import org.xml.sax.InputSource;
 
 public class DlnaService {
+    public interface PlaybackListener {
+        void onPlaybackEnded(DeviceModel device);
+    }
+
     private final ObservableList<DeviceModel> devices = FXCollections.observableArrayList();
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "DLNA-Worker");
         t.setDaemon(true);
         return t;
     });
+
+    private PlaybackListener playbackListener;
+    private volatile DeviceModel activePlayingDevice;
+    private volatile boolean isPolling = false;
+    private volatile boolean shutdownRequested = false;
+    private Thread pollingThread;
 
     // SSDP constants
     private static final String SSDP_ADDR = "239.255.255.250";
@@ -288,6 +298,7 @@ public class DlnaService {
 
                 System.out.println("DLNA: Play command sent successfully.");
                 Platform.runLater(() -> System.out.println("DLNA: Playing on " + device));
+                startPolling(device);
             } catch (Exception e) {
                 System.err.println("DLNA: Play failed: " + e.getMessage());
             }
@@ -300,6 +311,7 @@ public class DlnaService {
     public void stop(DeviceModel device) {
         if (device == null)
             return;
+        activePlayingDevice = null;
         executor.submit(() -> {
             try {
                 System.out.println("DLNA: Sending Stop to " + device);
@@ -333,12 +345,13 @@ public class DlnaService {
      */
     private String buildDIDL(String title, String url) {
         String mimeType = guessMimeType(url);
+        String upnpClass = mimeType.startsWith("audio/") ? "object.item.audioItem" : "object.item.videoItem";
         return "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\""
                 + " xmlns:dc=\"http://purl.org/dc/elements/1.1/\""
                 + " xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">"
                 + "<item id=\"0\" parentID=\"-1\" restricted=\"1\">"
                 + "<dc:title>" + escapeXml(title) + "</dc:title>"
-                + "<upnp:class>object.item.videoItem</upnp:class>"
+                + "<upnp:class>" + upnpClass + "</upnp:class>"
                 + "<res protocolInfo=\"http-get:*:" + mimeType + ":*\">" + escapeXml(url) + "</res>"
                 + "</item>"
                 + "</DIDL-Lite>";
@@ -347,7 +360,7 @@ public class DlnaService {
     /**
      * Send a SOAP action to the device's AVTransport control URL.
      */
-    private void sendSoapAction(String controlUrl, String action, String soapBody) throws IOException {
+    private String sendSoapAction(String controlUrl, String action, String soapBody) throws IOException {
         System.out.println("\n--- SOAP Request ---");
         System.out.println("DLNA: Action: " + action);
         System.out.println("DLNA: URL: " + controlUrl);
@@ -380,6 +393,8 @@ public class DlnaService {
                     responseBody = new String(is.readAllBytes(), StandardCharsets.UTF_8);
             }
             System.out.println("DLNA: Response Body:\n" + responseBody);
+            System.out.println("--------------------\n");
+            return responseBody;
         } else {
             String error = "";
             try (InputStream es = conn.getErrorStream()) {
@@ -387,8 +402,9 @@ public class DlnaService {
                     error = new String(es.readAllBytes(), StandardCharsets.UTF_8);
             }
             System.err.println("DLNA: Error Body:\n" + error);
+            System.out.println("--------------------\n");
+            throw new IOException("HTTP " + code + ": " + error);
         }
-        System.out.println("--------------------\n");
     }
 
     /**
@@ -423,10 +439,69 @@ public class DlnaService {
     }
 
     public void shutdown() {
+        shutdownRequested = true;
         executor.shutdownNow();
     }
 
     public ObservableList<DeviceModel> getDevices() {
         return devices;
+    }
+
+    public void setPlaybackListener(PlaybackListener listener) {
+        this.playbackListener = listener;
+    }
+
+    private void startPolling(DeviceModel device) {
+        activePlayingDevice = device;
+        if (isPolling)
+            return; // already running
+
+        isPolling = true;
+        pollingThread = new Thread(() -> {
+            String lastState = "";
+            while (isPolling && !shutdownRequested) {
+                try {
+                    Thread.sleep(3000);
+                    if (activePlayingDevice == null) {
+                        lastState = "";
+                        continue;
+                    }
+
+                    String state = getTransportState(activePlayingDevice);
+                    if (state != null) {
+                        if ("PLAYING".equals(lastState) && "STOPPED".equals(state)) {
+                            // Playback naturally ended
+                            if (playbackListener != null) {
+                                DeviceModel dev = activePlayingDevice;
+                                activePlayingDevice = null;
+                                playbackListener.onPlaybackEnded(dev);
+                            }
+                        }
+                        if (activePlayingDevice != null) {
+                            lastState = state;
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            isPolling = false;
+        }, "DLNA-Poller");
+        pollingThread.setDaemon(true);
+        pollingThread.start();
+    }
+
+    private String getTransportState(DeviceModel device) {
+        try {
+            String body = buildSoapEnvelope("GetTransportInfo", "<InstanceID>0</InstanceID>");
+            String response = sendSoapAction(device.getControlUrl(), "GetTransportInfo", body);
+            Document doc = DocumentBuilderFactory.newInstance()
+                    .newDocumentBuilder()
+                    .parse(new InputSource(new StringReader(response)));
+            return getTagText(doc, "CurrentTransportState");
+        } catch (Exception e) {
+            return null;
+        }
     }
 }

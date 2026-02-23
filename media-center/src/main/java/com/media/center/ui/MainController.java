@@ -43,7 +43,10 @@ public class MainController {
     @FXML
     private ListView<DeviceModel> deviceList;
     @FXML
-    private Label selectedFileLabel;
+    private ListView<File> playlistView;
+    private javafx.collections.ObservableList<File> playlist = javafx.collections.FXCollections.observableArrayList();
+    private File activePlayingFile = null;
+
     @FXML
     private TextField videoUrlField;
     @FXML
@@ -56,7 +59,6 @@ public class MainController {
     private TorrentService torrentService;
     private DlnaService dlnaService;
     private ContentServer contentServer;
-    private File fileToCast;
     private List<NetworkInterface> availableAdapters = new ArrayList<>();
 
     public void initialize() {
@@ -169,6 +171,36 @@ public class MainController {
         } catch (Exception e) {
             networkInfoLabel.setText("Network: error enumerating adapters");
         }
+
+        playlistView.setItems(playlist);
+        playlistView.setCellFactory(lv -> new javafx.scene.control.ListCell<File>() {
+            @Override
+            protected void updateItem(File file, boolean empty) {
+                super.updateItem(file, empty);
+                if (empty || file == null) {
+                    setText(null);
+                    setStyle("");
+                } else {
+                    String prefix = file.equals(activePlayingFile) ? "[PLAYING] " : "";
+                    setText(prefix + file.getName());
+                    if (file.equals(activePlayingFile)) {
+                        setStyle("-fx-font-weight: bold; -fx-text-fill: #008800;");
+                    } else {
+                        setStyle("");
+                    }
+                }
+            }
+        });
+
+        playlistView.setOnMouseClicked(event -> {
+            if (event.getClickCount() == 2 && playlistView.getSelectionModel().getSelectedItem() != null) {
+                play();
+            }
+        });
+
+        dlnaService.setPlaybackListener(device -> {
+            javafx.application.Platform.runLater(() -> handlePlaybackEnded(device));
+        });
 
         // Initial SSDP discovery on default adapter
         dlnaService.start();
@@ -404,15 +436,30 @@ public class MainController {
     }
 
     @FXML
-    private void browseFile() {
+    private void addFilesToPlaylist() {
         FileChooser chooser = new FileChooser();
-        File file = chooser.showOpenDialog(selectedFileLabel.getScene().getWindow());
-        if (file != null) {
-            fileToCast = file;
-            selectedFileLabel.setText(file.getName());
-            contentServer.setFileToServe(file);
-            videoUrlField.setText(contentServer.getServeUrl());
+        chooser.setTitle("Select Media Files");
+        List<File> files = chooser.showOpenMultipleDialog(playlistView.getScene().getWindow());
+        if (files != null) {
+            playlist.addAll(files);
         }
+    }
+
+    @FXML
+    private void removeSelectedFromPlaylist() {
+        File selected = playlistView.getSelectionModel().getSelectedItem();
+        if (selected != null) {
+            playlist.remove(selected);
+            if (selected.equals(activePlayingFile)) {
+                stop();
+            }
+        }
+    }
+
+    @FXML
+    private void clearPlaylist() {
+        playlist.clear();
+        stop();
     }
 
     @FXML
@@ -426,13 +473,36 @@ public class MainController {
     @FXML
     private void play() {
         DeviceModel device = deviceList.getSelectionModel().getSelectedItem();
-        if (device != null && fileToCast != null) {
-            statusLabel.setText("Casting to " + device.toString());
-            String url = contentServer.getServeUrl();
-            dlnaService.play(device, url, fileToCast.getName());
-        } else {
-            statusLabel.setText("Select a device and a file first.");
+        if (device == null) {
+            statusLabel.setText("Select a device first.");
+            return;
         }
+
+        File selectedFile = playlistView.getSelectionModel().getSelectedItem();
+        if (selectedFile == null && !playlist.isEmpty()) {
+            selectedFile = playlist.get(0);
+            playlistView.getSelectionModel().select(0);
+        }
+
+        if (selectedFile == null) {
+            statusLabel.setText("No file to play.");
+            return;
+        }
+
+        if (contentServer == null) {
+            statusLabel.setText("Content server is not running.");
+            return;
+        }
+
+        activePlayingFile = selectedFile;
+        playlistView.refresh();
+
+        contentServer.setFileToServe(activePlayingFile);
+        String url = contentServer.getServeUrl();
+        videoUrlField.setText(url);
+
+        statusLabel.setText("Casting to " + device.toString());
+        dlnaService.play(device, url, activePlayingFile.getName());
     }
 
     @FXML
@@ -440,7 +510,29 @@ public class MainController {
         DeviceModel device = deviceList.getSelectionModel().getSelectedItem();
         if (device != null) {
             dlnaService.stop(device);
-            statusLabel.setText("Stopped.");
+        }
+        activePlayingFile = null;
+        playlistView.refresh();
+        statusLabel.setText("Stopped.");
+        videoUrlField.clear();
+    }
+
+    private void handlePlaybackEnded(DeviceModel device) {
+        if (activePlayingFile == null)
+            return;
+
+        int idx = playlist.indexOf(activePlayingFile);
+        if (idx >= 0 && idx < playlist.size() - 1) {
+            // Play next
+            File nextFile = playlist.get(idx + 1);
+            playlistView.getSelectionModel().select(nextFile);
+            play();
+        } else {
+            // Reached end of playlist
+            activePlayingFile = null;
+            playlistView.refresh();
+            dlnaService.stop(device);
+            statusLabel.setText("Playlist ended.");
         }
     }
 
@@ -459,7 +551,7 @@ public class MainController {
 
                 // Update the video URL field if a file is already selected, as the IP may have
                 // changed
-                if (contentServer != null && fileToCast != null) {
+                if (contentServer != null && activePlayingFile != null) {
                     javafx.application.Platform.runLater(() -> {
                         // Restart server binding to new IP if needed, or at least update the displayed
                         // URL

@@ -10,15 +10,15 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.UUID;
 
 public class ContentServer {
     private HttpServer server;
     private final int port = 8192;
     private String hostname;
     private static File activeFile = null;
+    private static String activeFileId = null;
 
     public ContentServer() throws IOException {
         String host = InetAddress.getLocalHost().getHostAddress();
@@ -42,14 +42,19 @@ public class ContentServer {
 
     public void setFileToServe(File file) {
         activeFile = file;
+        activeFileId = UUID.randomUUID().toString();
     }
 
     public String getServeUrl() {
-        if (activeFile == null)
+        if (activeFile == null || activeFileId == null)
             return "";
         try {
-            return "http://" + hostname + ":" + port + "/video/"
-                    + URLEncoder.encode(activeFile.getName(), StandardCharsets.UTF_8.name()).replace("+", "%20");
+            String ext = "";
+            int i = activeFile.getName().lastIndexOf('.');
+            if (i > 0) {
+                ext = activeFile.getName().substring(i);
+            }
+            return "http://" + hostname + ":" + port + "/video/" + activeFileId + ext;
         } catch (Exception e) {
             return "http://" + hostname + ":" + port + "/video/media.mp4";
         }
@@ -100,8 +105,17 @@ public class ContentServer {
             }
 
             String contentType = Files.probeContentType(file.toPath());
-            if (contentType == null)
-                contentType = "video/mp4";
+            if (contentType == null) {
+                String name = file.getName().toLowerCase();
+                if (name.endsWith(".mp3"))
+                    contentType = "audio/mpeg";
+                else if (name.endsWith(".flac"))
+                    contentType = "audio/flac";
+                else if (name.endsWith(".wav"))
+                    contentType = "audio/wav";
+                else
+                    contentType = "video/mp4";
+            }
 
             exchange.getResponseHeaders().set("Content-Type", contentType);
             exchange.getResponseHeaders().set("Accept-Ranges", "bytes");

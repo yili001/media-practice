@@ -2,6 +2,7 @@ com\media\center\service\DlnaService.class
 com\media\center\ui\MainController.class
 com\media\center\main\MainApp.class
 com\media\center\service\DownloadSession.class
+com\media\center\ui\MainController$3.class
 com\media\center\service\TorrentFile.class
 com\media\center\service\torrent\MetadataFetcher.class
 com\media\center\service\TorrentService.class
@@ -10,6 +11,7 @@ com\media\center\service\ContentServer.class
 com\media\center\service\torrent\MagnetLink.class
 com\media\center\ui\MainController$2.class
 com\media\center\service\torrent\TrackerClient$Peer.class
+com\media\center\service\DlnaService$PlaybackListener.class
 com\media\center\service\ContentServer$FileHandler.class
 com\media\center\service\torrent\TrackerClient.class
 com\media\center\service\torrent\PeerConnection.class

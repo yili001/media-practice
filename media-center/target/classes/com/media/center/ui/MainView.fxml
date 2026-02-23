@@ -69,14 +69,20 @@
                        <children>
                           <VBox spacing="15.0" AnchorPane.bottomAnchor="10.0" AnchorPane.leftAnchor="10.0" AnchorPane.rightAnchor="10.0" AnchorPane.topAnchor="10.0">
                               <children>
-                                  <Label text="Select Media to Cast:" />
-                                  <Button mnemonicParsing="false" onAction="#browseFile" text="Browse Local File..." />
-                                  <Label fx:id="selectedFileLabel" text="No file selected" wrapText="true" />
-                                  <Label text="Video URL:" />
+                                  <HBox alignment="CENTER_LEFT" spacing="10.0">
+                                      <Label text="Playlist:" style="-fx-font-weight: bold;"/>
+                                      <javafx.scene.layout.Region HBox.hgrow="ALWAYS" />
+                                      <Button mnemonicParsing="false" onAction="#addFilesToPlaylist" text="Add File(s)" />
+                                      <Button mnemonicParsing="false" onAction="#removeSelectedFromPlaylist" text="Remove" />
+                                      <Button mnemonicParsing="false" onAction="#clearPlaylist" text="Clear" />
+                                  </HBox>
+                                  <ListView fx:id="playlistView" prefHeight="150.0" VBox.vgrow="ALWAYS" />
+
+                                  <Label text="Active Media URL:" />
                                   <TextField fx:id="videoUrlField" editable="false" promptText="URL will appear here" />
                                   <HBox spacing="10.0">
                                       <children>
-                                          <Button mnemonicParsing="false" onAction="#play" text="Play on Device" />
+                                          <Button mnemonicParsing="false" onAction="#play" text="Play Selected" />
                                           <Button mnemonicParsing="false" onAction="#stop" text="Stop" />
                                       </children>
                                   </HBox>
